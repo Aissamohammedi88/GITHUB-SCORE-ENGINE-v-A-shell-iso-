@@ -16,3 +16,33 @@ bin-release/
 # Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
 # should NOT be excluded as they contain compiler settings and other important
 # information for Eclipse / Flash Builder.
+# --- Python ---
+# Ignore les fichiers compilés et le cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Environnements Virtuels ---
+# Ignore les dossiers d'installation des dépendances
+.venv/
+venv/
+ENV/
+env/
+
+# --- Secrets et Configuration ---
+# TRÈS IMPORTANT : Ignore les fichiers contenant des clés API ou tokens
+.env
+secrets.json
+
+# --- Système et IDE ---
+# Fichiers générés par macOS ou Windows
+.DS_Store
+Thumbs.db
+
+# Configuration des éditeurs (VS Code, PyCharm)
+.vscode/
+.idea/
+
+# --- Logs ---
+# Ignore les fichiers de logs générés par le programme
+*.log
