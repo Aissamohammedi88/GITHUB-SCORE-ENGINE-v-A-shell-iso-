@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+
+# -*- coding: utf-8 -*-
+"""
+GITHUB SCORE ENGINE
+Analyse un repo GitHub via l'API publique.
+Calcule un score reel sur 100.
+"""
+import os
+import sys
+import json
+import time
+import math
+import socket
+import statistics
+import urllib.request
+import urllib.error
+import urllib.parse
+import http.server
+import socketserver
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Optional, Dict, List, Any
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════
+PORT = int(os.environ.get("PORT", 9300))
+HOST = "0.0.0.0"
+API = "https://api.github.com"
+TOKEN = os.environ.get("GITHUB_TOKEN", "")
+
+G = "\033[92m"; Y = "\033[93m"; R = "\033[91m"; B = "\033[94m"; C = "\033[96m"; M = "\033[95m"; N = "\033[0m"
+
+def ok(m): print(G + "[OK] " + N + m)
+def warn(m): print(Y + "[!!] " + N + m)
+def err(m): print(R + "[KO] " + N + m)
+def info(m): print(B + "[i] " + N + m)
+
+
+# ═══════════════════════════════════════════════════════════════
+# HTTP CLIENT
+# ═══════════════════════════════════════════════════════════════
+def api_get(path, timeout=15):
+url = API + path
+req = urllib.request.Request(url)
+req.add_header("User-Agent", "GitHubScore/1.0")
+req.add_header("Accept", "application/vnd.github.v3+json")
+if TOKEN:
+req.add_header("Authorization", "token " + TOKEN)
+
+try:
+with urllib.request.urlopen(req, timeout=timeout) as r:
+return json.loads(r.read().decode("utf-8", errors="replace"))
+except urllib.error.HTTPError as e:
+return {"__error__": "HTTP " + str(e.code), "code": e.code}
+except urllib.error.URLError as e:
+return {"__error__": str(e.reason)}
+except Exception as e:
+return {"__error__": str(e)}
+
+
+def parse_repo_url(url):
+url = url.strip().rstrip("/")
+if url.endswith(".git"):
+url = url[:-4]
+if "github.com/" in url:
+parts = url.split("github.com/")[1].split("/")
+if len(parts) >= 2:
+return parts[0], parts[1]
+if "/" in url and not "://" in url:
+parts = url.split("/")
+if len(parts) >= 2:
+return parts[0], parts[1]
+return None, None
+
+
+# ═══════════════════════════════════════════════════════════════
+# SCORING ENGINE
+# ═══════════════════════════════════════════════════════════════
+class GitHubScorer:
+
+def __init__(self, owner, repo):
+self.owner = owner
+self.repo = repo
+self.repo_full = owner + "/" + repo
+self.data = {}
+
+def fetch_all(self):
+info("Recuperation des donnees pour " + self.repo_full)
+
+self.data["repo"] = api_get("/repos/" + self.repo_full)
+if self.data["repo"].get("__error__"):
+return False
+
+self.data["languages"] = api_get("/repos/" + self.repo_full + "/languages")
+self.data["contributors"] = api_get("/repos/" + self.repo_full + "/contributors?per_page=100")
+self.data["commits"] = api_get("/repos/" + self.repo_full + "/commits?per_page=100")
+self.data["releases"] = api_get("/repos/" + self.repo_full + "/releases?per_page=100")
+self.data["branches"] = api_get("/repos/" + self.repo_full + "/branches?per_page=100")
+self.data["tags"] = api_get("/repos/" + self.repo_full + "/tags?per_page=100")
+self.data["issues_open"] = api_get("/repos/" + self.repo_full + "/issues?state=open&per_page=100")
+self.data["issues_closed"] = api_get("/repos/" + self.repo_full + "/issues?state=closed&per_page=100")
+self.data["pulls"] = api_get("/repos/" + self.repo_full + "/pulls?state=all&per_page=100")
+
+# Root tree
+default_branch = self.data["repo"].get("default_branch", "main")
+self.data["tree"] = api_get("/repos/" + self.repo_full + "/git/trees/" + default_branch + "?recursive=1")
+
+return True
+
+# ───────────────────────────────────────────────────────────
+# CALCULS PAR DIMENSION (chacun sur 100)
+# ───────────────────────────────────────────────────────────
+def score_popularity(self):
+r = self.data["repo"]
+stars = r.get("stargazers_count", 0)
+forks = r.get("forks_count", 0)
+watchers = r.get("subscribers_count", r.get("watchers_count", 0))
+
+# Log scale (1 star = 10, 10 = 30, 100 = 50, 1000 = 70, 10000 = 90)
+star_score = min(100, math.log10(max(1, stars) + 1) * 25)
+fork_score = min(100, math.log10(max(1, forks) + 1) * 25)
+watch_score = min(100, math.log10(max(1, watchers) + 1) * 20)
+
+return round((star_score * 0.5 + fork_score * 0.3 + watch_score * 0.2), 2), {
+"stars": stars,
+"forks": forks,
+"watchers": watchers,
+}
+
+def score_activity(self):
+r = self.data["repo"]
+pushed = r.get("pushed_at", "")
+created = r.get("created_at", "")
+updated = r.get("updated_at", "")
+
+now = datetime.now(timezone.utc)
+
+days_since_push = 9999
+if pushed:
+try:
+dt = datetime.fromisoformat(pushed.replace("Z", "+00:00"))
+days_since_push = (now - dt).days
+except Exception:
+pass
+
+days_alive = 1
+if created:
+try:
+dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+days_alive = max(1, (now - dt).days)
+except Exception:
+pass
+
+# Score sur fraicheur
+if days_since_push <= 1:
+freshness = 100
+elif days_since_push <= 7:
+freshness = 90
+elif days_since_push <= 30:
+freshness = 75
+elif days_since_push <= 90:
+freshness = 55
+elif days_since_push <= 365:
+freshness = 30
+else:
+freshness = 10
+
+# Score sur historique
+commits = self.data.get("commits", [])
+commit_count = len(commits) if isinstance(commits, list) else 0
+commit_score = min(100, math.log10(max(1, commit_count) + 1) * 33)
+
+return round((freshness * 0.6 + commit_score * 0.4), 2), {
+"days_since_push": days_since_push,
+"days_alive": days_alive,
+"recent_commits": commit_count,
+}
+
+def score_documentation(self):
+r = self.data["repo"]
+has_description = bool(r.get("description"))
+has_homepage = bool(r.get("homepage"))
+has_license = r.get("license") is not None
+has_topics = len(r.get("topics", [])) > 0
+has_wiki = r.get("has_wiki", False)
+has_pages = r.get("has_pages", False)
+
+# Fichiers cles
+tree = self.data.get("tree", {})
+files = []
+if isinstance(tree, dict) and "tree" in tree:
+files = [f["path"] for f in tree.get("tree", []) if f.get("type") == "blob"]
+
+files_lower = [f.lower() for f in files]
+has_readme = any("readme" in f for f in files_lower)
+has_contributing = any("contributing" in f for f in files_lower)
+has_code_of_conduct = any("code_of_conduct" in f or "code-of-conduct" in f for f in files_lower)
+has_changelog = any("changelog" in f for f in files_lower)
+has_security = any("security.md" in f for f in files_lower)
+has_docs_folder = any(f.startswith("docs/") for f in files_lower)
+has_examples = any("example" in f for f in files_lower)
+
+score = 0
+if has_description: score += 15
+if has_homepage: score += 5
+if has_license: score += 10
+if has_topics: score += 5
+if has_readme: score += 20
+if has_contributing: score += 10
+if has_code_of_conduct: score += 5
+if has_changelog: score += 5
+if has_security: score += 10
+if has_docs_folder: score += 10
+if has_examples: score += 5
+
+return min(100, score), {
+"description": has_description,
+"homepage": has_homepage,
+"license": has_license,
+"topics": has_topics,
+"readme": has_readme,
+"contributing": has_contributing,
+"code_of_conduct": has_code_of_conduct,
+"changelog": has_changelog,
+"security": has_security,
+"docs_folder": has_docs_folder,
+"examples": has_examples,
+}
+
+def score_quality(self):
+r = self.data["repo"]
+open_issues = r.get("open_issues_count", 0)
+
+closed_issues = self.data.get("issues_closed", [])
+closed_count = len(closed_issues) if isinstance(closed_issues, list) else 0
+
+total_issues = open_issues + closed_count
+if total_issues > 0:
+resolution_rate = closed_count / total_issues
+else:
+resolution_rate = 0.5
+
+# Si pas d'issues, neutre
+if total_issues < 5:
+issue_score = 50
+else:
+issue_score = resolution_rate * 100
+
+# PRs
+pulls = self.data.get("pulls", [])
+pull_count = len(pulls) if isinstance(pulls, list) else 0
+pr_score = min(100, math.log10(max(1, pull_count) + 1) * 40)
+
+# Branches
+branches = self.data.get("branches", [])
+branch_count = len(branches) if isinstance(branches, list) else 0
+branch_score = min(100, math.log10(max(1, branch_count) + 1) * 30)
+
+return round((issue_score * 0.5 + pr_score * 0.25 + branch_score * 0.25), 2), {
+"open_issues": open_issues,
+"closed_issues": closed_count,
+"resolution_rate": round(resolution_rate * 100, 1),
+"pull_requests": pull_count,
+"branches": branch_count,
+}
+
+def score_community(self):
+contributors = self.data.get("contributors", [])
+contributor_count = len(contributors) if isinstance(contributors, list) else 0
+
+r = self.data["repo"]
+forks = r.get("forks_count", 0)
+watchers = r.get("subscribers_count", r.get("watchers_count", 0))
+
+contributor_score = min(100, math.log10(max(1, contributor_count) + 1) * 40)
+fork_score = min(100, math.log10(max(1, forks) + 1) * 25)
+watch_score = min(100, math.log10(max(1, watchers) + 1) * 20)
+
+# Network count = forks + contributors
+network_score = min(100, math.log10(max(1, forks + contributor_count) + 1) * 30)
+
+return round((contributor_score * 0.4 + fork_score * 0.3 + watch_score * 0.15 + network_score * 0.15), 2), {
+"contributors": contributor_count,
+"forks": forks,
+"watchers": watchers,
+}
+
+def score_maintenance(self):
+r = self.data["repo"]
+is_archived = r.get("archived", False)
+is_disabled = r.get("disabled", False)
+is_fork = r.get("fork", False)
+
+score = 100
+if is_archived: score -= 40
+if is_disabled: score -= 50
+if is_fork: score -= 20
+
+# Releases
+releases = self.data.get("releases", [])
+release_count = len(releases) if isinstance(releases, list) else 0
+if release_count > 0:
+score = min(100, score + 10)
+
+# Tags
+tags = self.data.get("tags", [])
+tag_count = len(tags) if isinstance(tags, list) else 0
+if tag_count > 3:
+score = min(100, score + 5)
+
+return max(0, min(100, score)), {
+"archived": is_archived,
+"disabled": is_disabled,
+"is_fork": is_fork,
+"releases": release_count,
+"tags": tag_count,
+}
+
+def score_languages(self):
+langs = self.data.get("languages", {})
+if not isinstance(langs, dict) or not langs:
+return 30, {"count": 0, "languages": {}}
+
+total = sum(langs.values())
+count = len(langs)
+
+# Score basé sur le nombre de langages
+lang_score = min(100, count * 15)
+
+# Score basé sur la diversité
+if total > 0:
+top_lang_pct = max(langs.values()) / total
+diversity_score = min(100, (1 - top_lang_pct) * 150)
+else:
+diversity_score = 0
+
+return round((lang_score * 0.5 + diversity_score * 0.5), 2), {
+"count": count,
+"languages": {k: round(v / total * 100, 1) for k, v in langs.items()} if total > 0 else {},
+}
+
+def score_size(self):
+r = self.data["repo"]
+size_kb = r.get("size", 0)
+
+if size_kb < 10:
+score = 20
+elif size_kb < 100:
+score = 40
+elif size_kb < 1000:
+score = 65
+elif size_kb < 10000:
+score = 85
+elif size_kb < 100000:
+score = 100
+else:
+score = 90
+
+return score, {"size_kb": size_kb, "size_mb": round(size_kb / 1024, 2)}
+
+def score_all(self):
+if not self.fetch_all():
+return {"error": "Impossible de recuperer les donnees"}
+
+pop_score, pop_data = self.score_popularity()
+act_score, act_data = self.score_activity()
+doc_score, doc_data = self.score_documentation()
+qua_score, qua_data = self.score_quality()
+com_score, com_data = self.score_community()
+mai_score, mai_data = self.score_maintenance()
+lan_score, lan_data = self.score_languages()
+siz_score, siz_data = self.score_size()
+
+# Score global (pondere)
+weights = {
+"popularity": 0.20,
+"activity": 0.20,
+"documentation": 0.15,
+"quality": 0.15,
+"community": 0.15,
+"maintenance": 0.05,
+"languages": 0.05,
+"size": 0.05,
+}
+
+scores = {
+"popularity": pop_score,
+"activity": act_score,
+"documentation": doc_score,
+"quality": qua_score,
+"community": com_score,
+"maintenance": mai_score,
+"languages": lan_score,
+"size": siz_score,
+}
+
+global_score = sum(scores[k] * weights[k] for k in weights)
+
+# Grade
+if global_score >= 90:
+grade = "S"
+verdict = "EXCEPTIONNEL"
+elif global_score >= 80:
+grade = "A"
+verdict = "EXCELLENT"
+elif global_score >= 70:
+grade = "B"
+verdict = "TRES BON"
+elif global_score >= 60:
+grade = "C"
+verdict = "BON"
+elif global_score >= 50:
+grade = "D"
+verdict = "MOYEN"
+elif global_score >= 35:
+grade = "E"
+verdict = "FAIBLE"
+else:
+grade = "F"
+verdict = "DEBUTANT"
+
+r = self.data["repo"]
+
+return {
+"ok": True,
+"repo": {
+"full_name": r.get("full_name"),
+"description": r.get("description"),
+"url": r.get("html_url"),
+"homepage": r.get("homepage"),
+"created_at": r.get("created_at"),
+"pushed_at": r.get("pushed_at"),
+"default_branch": r.get("default_branch"),
+"license": (r.get("license") or {}).get("name") if r.get("license") else None,
+"topics": r.get("topics", []),
+"owner_avatar": (r.get("owner") or {}).get("avatar_url"),
+"owner_url": (r.get("owner") or {}).get("html_url"),
+},
+"global_score": round(global_score, 2),
+"grade": grade,
+"verdict": verdict,
+"scores": scores,
+"details": {
+"popularity": pop_data,
+"activity": act_data,
+"documentation": doc_data,
+"quality": qua_data,
+"community": com_data,
+"maintenance": mai_data,
+"languages": lan_data,
+"size": siz_data,
+},
+"weights": weights,
+"links": {
+"repo": r.get("html_url"),
+"issues": r.get("html_url") + "/issues",
+"pulls": r.get("html_url") + "/pulls",
+"releases": r.get("html_url") + "/releases",
+"commits": r.get("html_url") + "/commits",
+"contributors": r.get("html_url") + "/graphs/contributors",
+"network": r.get("html_url") + "/network",
+"wiki": r.get("html_url") + "/wiki",
+"actions": r.get("html_url") + "/actions",
+},
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# HTML PAGE
+# ═══════════════════════════════════════════════════════════════
+PAGE = """<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GitHub Score Engine</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,system-ui,sans-serif;background:#0a0014;color:#fff;padding:20px;min-height:100vh;background-image:radial-gradient(ellipse at top,rgba(200,164,92,0.08),transparent 60%)}
+.c{max-width:1000px;margin:0 auto}
+h1{color:#c8a45c;font-size:26px;margin-bottom:6px}
+.s{color:#888;font-size:12px;margin-bottom:20px}
+.b{background:#14001f;border:1px solid #2a1a3a;border-radius:12px;padding:20px;margin-bottom:16px}
+.b h2{color:#c8a45c;font-size:14px;margin-bottom:12px;text-transform:uppercase;letter-spacing:1px}
+input{width:100%;background:#0a0014;border:1px solid #2a1a3a;color:#4ade80;padding:12px;border-radius:8px;font-family:monospace;font-size:13px;margin-bottom:10px}
+button{background:#c8a45c;color:#000;border:none;padding:10px 20px;border-radius:999px;font-weight:700;cursor:pointer;font-size:13px;margin-right:6px}
+button:hover{opacity:0.9}
+button:disabled{opacity:0.5;cursor:not-allowed}
+.score-big{text-align:center;padding:30px 20px;background:linear-gradient(135deg,#14001f,#0a0014);border-radius:12px;border:2px solid #c8a45c;margin-bottom:16px}
+.score-num{font-size:72px;font-weight:900;color:#c8a45c;line-height:1;letter-spacing:-3px}
+.score-grade{font-size:24px;color:#4ade80;margin-top:8px;letter-spacing:4px}
+.score-verdict{font-size:12px;color:#888;text-transform:uppercase;letter-spacing:2px;margin-top:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px}
+.dim{background:#14001f;border:1px solid #2a1a3a;border-radius:10px;padding:14px}
+.dim .label{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
+.dim .val{font-size:24px;font-weight:700;color:#c8a45c;line-height:1}
+.bar{height:6px;background:#0a0014;border-radius:3px;margin-top:8px;overflow:hidden}
+.bar-fill{height:100%;background:linear-gradient(90deg,#c8a45c,#4ade80);border-radius:3px;transition:width 0.8s}
+.meta{display:flex;gap:12px;align-items:center;padding:12px;background:#0a0014;border-radius:8px;margin-bottom:12px}
+.meta img{width:48px;height:48px;border-radius:50%;border:2px solid #c8a45c}
+.meta .info{flex:1}
+.meta .name{font-size:15px;font-weight:700;color:#fff}
+.meta .desc{font-size:12px;color:#888;margin-top:2px}
+.link{display:inline-block;background:#1a0028;border:1px solid #2a1a3a;color:#4ade80;text-decoration:none;padding:6px 12px;border-radius:6px;font-size:11px;margin:3px 3px 3px 0;font-family:monospace}
+.link:hover{border-color:#c8a45c;color:#c8a45c}
+.detail{background:#0a0014;border-radius:8px;padding:12px;font-family:monospace;font-size:11px;color:#888;line-height:1.7}
+.detail .k{color:#c8a45c}
+pre{white-space:pre-wrap;word-wrap:break-word}
+.loader{text-align:center;padding:30px;color:#c8a45c}
+.sp{display:inline-block;width:32px;height:32px;border:3px solid rgba(200,164,92,0.2);border-top-color:#c8a45c;border-radius:50%;animation:spin 0.8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style></head><body><div class="c">
+<h1>GitHub Score Engine</h1>
+<p class="s">Analyse n'importe quel repo GitHub. Score reel sur 100.</p>
+
+<div class="b">
+<h2>Repo a analyser</h2>
+<input id="url" placeholder="https://github.com/owner/repo" value="https://github.com/Aissamohammedi88/nekyll-is-a-static-site-generator-with-built-in-">
+<button id="btn" onclick="analyser()">ANALYSER</button>
+<button onclick="analyserExemple()">EXEMPLE</button>
+</div>
+
+<div id="out"></div>
+</div>
+<script>
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+
+async function analyser(){
+var url = document.getElementById('url').value.trim();
+if(!url){ alert('Entre une URL'); return; }
+document.getElementById('btn').disabled = true;
+document.getElementById('out').innerHTML = '<div class="b"><div class="loader"><div class="sp"></div><p>Analyse en cours...</p></div></div>';
+try{
+var r = await fetch('/api/score?url=' + encodeURIComponent(url));
+var d = await r.json();
+if(d.error){ document.getElementById('out').innerHTML = '<div class="b"><p style="color:#f87171">' + esc(d.error) + '</p></div>'; }
+else{ afficher(d); }
+}catch(e){ document.getElementById('out').innerHTML = '<div class="b"><p style="color:#f87171">' + esc(e.message) + '</p></div>'; }
+finally{ document.getElementById('btn').disabled = false; }
+}
+
+function analyserExemple(){
+document.getElementById('url').value = 'https://github.com/torvalds/linux';
+analyser();
+}
+
+function afficher(d){
+var h = '';
+// Score global
+h += '<div class="score-big">';
+h += '<div class="score-num">' + d.global_score + '</div>';
+h += '<div class="score-grade">' + esc(d.grade) + '</div>';
+h += '<div class="score-verdict">' + esc(d.verdict) + '</div>';
+h += '</div>';
+
+// Meta
+h += '<div class="b"><div class="meta">';
+if(d.repo.owner_avatar) h += '<img src="' + esc(d.repo.owner_avatar) + '" alt="">';
+h += '<div class="info">';
+h += '<div class="name">' + esc(d.repo.full_name) + '</div>';
+if(d.repo.description) h += '<div class="desc">' + esc(d.repo.description) + '</div>';
+h += '</div></div>';
+if(d.repo.topics && d.repo.topics.length){
+d.repo.topics.forEach(function(t){ h += '<span class="link">' + esc(t) + '</span>'; });
+h += '<div style="height:8px"></div>';
+}
+h += '</div>';
+
+// Liens
+h += '<div class="b"><h2>Liens directs</h2>';
+var links = d.links;
+Object.keys(links).forEach(function(k){
+if(links[k]) h += '<a class="link" href="' + esc(links[k]) + '" target="_blank">' + esc(k) + ' ></a>';
+});
+h += '</div>';
+
+// Scores dimension
+h += '<div class="b"><h2>Score par dimension</h2><div class="grid">';
+var names = {
+popularity: 'Popularite',
+activity: 'Activite',
+documentation: 'Documentation',
+quality: 'Qualite',
+community: 'Communaute',
+maintenance: 'Maintenance',
+languages: 'Langages',
+size: 'Taille',
+};
+Object.keys(d.scores).forEach(function(k){
+var v = d.scores[k];
+var weight = (d.weights[k] * 100).toFixed(0);
+h += '<div class="dim">';
+h += '<div class="label">' + esc(names[k] || k) + ' (' + weight + '%)</div>';
+h += '<div class="val">' + v + '</div>';
+h += '<div class="bar"><div class="bar-fill" style="width:' + v + '%"></div></div>';
+h += '</div>';
+});
+h += '</div></div>';
+
+// Details
+h += '<div class="b"><h2>Details</h2><div class="detail"><pre>';
+h += JSON.stringify(d.details, null, 2);
+h += '</pre></div></div>';
+
+document.getElementById('out').innerHTML = h;
+}
+</script>
+</body></html>"""
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+def log_message(self, *a):
+pass
+
+def _send(self, code, body, ctype="text/html; charset=utf-8"):
+if isinstance(body, str):
+body = body.encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", ctype)
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Access-Control-Allow-Origin", "*")
+self.end_headers()
+try:
+self.wfile.write(body)
+except Exception:
+pass
+
+def do_GET(self):
+import urllib.parse as up
+p = up.urlparse(self.path)
+path = p.path
+qs = up.parse_qs(p.query)
+
+if path in ("/", "/index.html"):
+self._send(200, PAGE)
+
+elif path == "/api/score":
+url = qs.get("url", [""])[0]
+if not url:
+self._send(400, json.dumps({"error": "URL manquante"}), "application/json")
+return
+owner, repo = parse_repo_url(url)
+if not owner or not repo:
+self._send(400, json.dumps({"error": "URL GitHub invalide"}), "application/json")
+return
+scorer = GitHubScorer(owner, repo)
+result = scorer.score_all()
+self._send(200, json.dumps(result, ensure_ascii=False, default=str),
+"application/json; charset=utf-8")
+
+elif path == "/api/health":
+self._send(200, json.dumps({"status": "ok", "token": bool(TOKEN)}),
+"application/json")
+
+else:
+self._send(404, "<h1>404</h1>")
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+def local_ip():
+try:
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("8.8.8.8", 80))
+ip = s.getsockname()[0]
+s.close()
+return ip
+except Exception:
+return "127.0.0.1"
+
+
+def cli_score(url):
+owner, repo = parse_repo_url(url)
+if not owner or not repo:
+err("URL GitHub invalide")
+return
+scorer = GitHubScorer(owner, repo)
+result = scorer.score_all()
+if result.get("error"):
+err(result["error"])
+return
+print()
+print(C + "=" * 60 + N)
+print(C + " " + result["repo"]["full_name"] + N)
+print(C + "=" * 60 + N)
+print(" Score global : " + G + str(result["global_score"]) + " / 100" + N)
+print(" Grade : " + G + result["grade"] + N)
+print(" Verdict : " + result["verdict"])
+print()
+for k, v in result["scores"].items():
+print(" " + k.ljust(15) + " : " + str(v).rjust(6) + " (" + str(int(result["weights"][k] * 100)) + "%)")
+print()
+
+
+def main():
+if len(sys.argv) > 1 and sys.argv[1] not in ("--web",):
+cli_score(sys.argv[1])
+return
+
+print()
+print(C + "=" * 70 + N)
+print(C + " GITHUB SCORE ENGINE" + N)
+print(C + "=" * 70 + N)
+print(" Port : " + str(PORT))
+print(" Token : " + ("present" if TOKEN else "absent (rate limit 60/h)"))
+print(" Local : http://127.0.0.1:" + str(PORT) + "/")
+print(" Reseau : http://" + local_ip() + ":" + str(PORT) + "/")
+print()
+print(" Usage CLI : python3 github_score.py <url>")
+print()
+
+try:
+with Server((HOST, PORT), Handler) as httpd:
+httpd.serve_forever()
+except KeyboardInterrupt:
+print("\nArrete.")
+except OSError as e:
+err("Port " + str(PORT) + " : " + str(e))
+
+
+if __name__ == "__main__":
+main()
