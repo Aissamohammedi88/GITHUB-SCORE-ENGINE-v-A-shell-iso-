@@ -1,0 +1,1512 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+GITHUB ANALYTICS ENGINE v2.0
+Moteur d'analyse GitHub complet - Scores, trafic, graphiques HD
+Auteur : Aissa Mohammedi (DGK)
+~2000 lignes - 0 dependance externe
+"""
+
+import os
+import sys
+import json
+import time
+import math
+import socket
+import statistics
+import urllib.request
+import urllib.error
+import urllib.parse
+import http.server
+import socketserver
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, List, Any, Tuple
+from collections import Counter, defaultdict
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+VERSION = "2.0.0"
+AUTHOR = "Aissa Mohammedi (DGK)"
+PORT = int(os.environ.get("PORT", 9400))
+HOST = "0.0.0.0"
+API = "https://api.github.com"
+TOKEN = os.environ.get("GITHUB_TOKEN", "")
+
+G = "\033[92m"; Y = "\033[93m"; R = "\033[91m"; B = "\033[94m"; C = "\033[96m"; M = "\033[95m"; N = "\033[0m"
+
+def ok(m): print(G + "[OK] " + N + m)
+def warn(m): print(Y + "[!!] " + N + m)
+def err(m): print(R + "[KO] " + N + m)
+def info(m): print(B + "[i] " + N + m)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTTP CLIENT
+# ══════════════════════════════════════════════════════════════════════════════
+class GitHubClient:
+
+def __init__(self, token=""):
+self.token = token
+self.rate_remaining = 60
+self.rate_limit = 60
+self.rate_reset = 0
+self.cache = {}
+self.request_count = 0
+
+def get(self, path, timeout=15, cache_ttl=300):
+# Cache
+cache_key = path
+if cache_key in self.cache:
+data, ts = self.cache[cache_key]
+if time.time() - ts < cache_ttl:
+return data
+
+url = API + path if not path.startswith("http") else path
+req = urllib.request.Request(url)
+req.add_header("User-Agent", "GitHubAnalytics/2.0")
+req.add_header("Accept", "application/vnd.github.v3+json")
+if self.token:
+req.add_header("Authorization", "token " + self.token)
+
+self.request_count += 1
+
+try:
+with urllib.request.urlopen(req, timeout=timeout) as r:
+# Lire rate limit
+self.rate_remaining = int(r.headers.get("X-RateLimit-Remaining", self.rate_remaining))
+self.rate_limit = int(r.headers.get("X-RateLimit-Limit", self.rate_limit))
+self.rate_reset = int(r.headers.get("X-RateLimit-Reset", 0))
+
+data = json.loads(r.read().decode("utf-8", errors="replace"))
+self.cache[cache_key] = (data, time.time())
+return data
+
+except urllib.error.HTTPError as e:
+if e.code == 404:
+return {"__error__": "not_found", "code": 404}
+if e.code == 403:
+return {"__error__": "rate_limit", "code": 403,
+"reset": e.headers.get("X-RateLimit-Reset")}
+return {"__error__": "HTTP " + str(e.code), "code": e.code}
+except Exception as e:
+return {"__error__": str(e)}
+
+def paginate(self, path, max_pages=3, per_page=100):
+"""Recupere plusieurs pages"""
+results = []
+sep = "&" if "?" in path else "?"
+for page in range(1, max_pages + 1):
+url = path + sep + "per_page=" + str(per_page) + "&page=" + str(page)
+data = self.get(url)
+if not isinstance(data, list):
+break
+if not data:
+break
+results.extend(data)
+if len(data) < per_page:
+break
+return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# URL PARSER
+# ══════════════════════════════════════════════════════════════════════════════
+def parse_url(url):
+url = url.strip().rstrip("/")
+if url.endswith(".git"):
+url = url[:-4]
+if "github.com/" in url:
+parts = url.split("github.com/")[1].split("/")
+if len(parts) >= 2:
+return parts[0], parts[1].split("?")[0].split("#")[0]
+if "/" in url and "://" not in url:
+parts = url.split("/")
+if len(parts) >= 2:
+return parts[0], parts[1]
+return None, None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANALYTICS ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+class AnalyticsEngine:
+
+def __init__(self, client, owner, repo):
+self.client = client
+self.owner = owner
+self.repo = repo
+self.full = owner + "/" + repo
+self.data = {}
+self.scores = {}
+self.metrics = {}
+self.graphs = {}
+
+# ──────────────────────────────────────────────────────────────────────────
+# FETCH
+# ──────────────────────────────────────────────────────────────────────────
+def fetch(self):
+info("Fetch " + self.full)
+base = "/repos/" + self.full
+
+r = self.client.get(base)
+if r.get("__error__"):
+return False
+
+self.data["repo"] = r
+self.data["languages"] = self.client.get(base + "/languages")
+self.data["contributors"] = self.client.paginate(base + "/contributors", max_pages=2)
+self.data["commits"] = self.client.paginate(base + "/commits", max_pages=3)
+self.data["releases"] = self.client.paginate(base + "/releases", max_pages=2)
+self.data["branches"] = self.client.paginate(base + "/branches", max_pages=2)
+self.data["tags"] = self.client.paginate(base + "/tags", max_pages=2)
+self.data["issues_open"] = self.client.paginate(base + "/issues?state=open", max_pages=2)
+self.data["issues_closed"] = self.client.paginate(base + "/issues?state=closed", max_pages=2)
+self.data["pulls_open"] = self.client.paginate(base + "/pulls?state=open", max_pages=2)
+self.data["pulls_closed"] = self.client.paginate(base + "/pulls?state=closed", max_pages=2)
+self.data["forks"] = self.client.paginate(base + "/forks", max_pages=2)
+self.data["stargazers"] = self.client.get(base + "/stargazers?per_page=1")
+self.data["topics"] = self.client.get(base + "/topics")
+
+default_branch = r.get("default_branch", "main")
+self.data["tree"] = self.client.get(base + "/git/trees/" + default_branch + "?recursive=1")
+
+return True
+
+# ──────────────────────────────────────────────────────────────────────────
+# METRICS CALCULATIONS
+# ──────────────────────────────────────────────────────────────────────────
+def compute_metrics(self):
+r = self.data["repo"]
+
+# Basic
+self.metrics["stars"] = r.get("stargazers_count", 0)
+self.metrics["forks"] = r.get("forks_count", 0)
+self.metrics["watchers"] = r.get("subscribers_count", 0)
+self.metrics["open_issues"] = r.get("open_issues_count", 0)
+self.metrics["size_kb"] = r.get("size", 0)
+self.metrics["size_mb"] = round(r.get("size", 0) / 1024, 2)
+self.metrics["default_branch"] = r.get("default_branch", "main")
+self.metrics["license"] = (r.get("license") or {}).get("name") if r.get("license") else "Aucune"
+self.metrics["language"] = r.get("language", "Inconnu")
+self.metrics["topics"] = r.get("topics", [])
+
+# Dates
+now = datetime.now(timezone.utc)
+
+try:
+created = datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))
+self.metrics["created_at"] = created.isoformat()
+self.metrics["age_days"] = (now - created).days
+self.metrics["age_years"] = round((now - created).days / 365.25, 2)
+except Exception:
+self.metrics["age_days"] = 0
+self.metrics["age_years"] = 0
+created = now
+
+try:
+pushed = datetime.fromisoformat(r["pushed_at"].replace("Z", "+00:00"))
+self.metrics["last_push"] = pushed.isoformat()
+self.metrics["days_since_push"] = (now - pushed).days
+except Exception:
+self.metrics["days_since_push"] = 9999
+
+try:
+updated = datetime.fromisoformat(r["updated_at"].replace("Z", "+00:00"))
+self.metrics["days_since_update"] = (now - updated).days
+except Exception:
+self.metrics["days_since_update"] = 9999
+
+# Contributors
+contributors = self.data.get("contributors", [])
+if isinstance(contributors, list):
+self.metrics["contributors"] = len(contributors)
+self.metrics["top_contributors"] = [
+{"login": c.get("login"), "contributions": c.get("contributions", 0),
+"avatar": c.get("avatar_url"), "url": c.get("html_url")}
+for c in contributors[:10]
+]
+else:
+self.metrics["contributors"] = 0
+self.metrics["top_contributors"] = []
+
+# Commits
+commits = self.data.get("commits", [])
+if isinstance(commits, list):
+self.metrics["recent_commits"] = len(commits)
+self.metrics["commit_frequency"] = self._compute_commit_frequency(commits)
+self.metrics["commit_heatmap"] = self._compute_heatmap(commits)
+self.metrics["commit_authors"] = self._compute_authors(commits)
+else:
+self.metrics["recent_commits"] = 0
+self.metrics["commit_frequency"] = {}
+self.metrics["commit_heatmap"] = {}
+self.metrics["commit_authors"] = {}
+
+# Issues
+issues_open = self.data.get("issues_open", [])
+issues_closed = self.data.get("issues_closed", [])
+self.metrics["issues_open_count"] = len(issues_open) if isinstance(issues_open, list) else 0
+self.metrics["issues_closed_count"] = len(issues_closed) if isinstance(issues_closed, list) else 0
+total_issues = self.metrics["issues_open_count"] + self.metrics["issues_closed_count"]
+self.metrics["issues_total"] = total_issues
+self.metrics["issue_resolution_rate"] = round(
+self.metrics["issues_closed_count"] / total_issues * 100, 1
+) if total_issues > 0 else 0.0
+
+# PRs
+pulls_open = self.data.get("pulls_open", [])
+pulls_closed = self.data.get("pulls_closed", [])
+self.metrics["pulls_open_count"] = len(pulls_open) if isinstance(pulls_open, list) else 0
+self.metrics["pulls_closed_count"] = len(pulls_closed) if isinstance(pulls_closed, list) else 0
+
+# Branches, tags, releases
+self.metrics["branches"] = len(self.data.get("branches", [])) if isinstance(self.data.get("branches"), list) else 0
+self.metrics["tags"] = len(self.data.get("tags", [])) if isinstance(self.data.get("tags"), list) else 0
+self.metrics["releases"] = len(self.data.get("releases", [])) if isinstance(self.data.get("releases"), list) else 0
+
+# Languages
+langs = self.data.get("languages", {})
+if isinstance(langs, dict) and langs:
+total = sum(langs.values())
+self.metrics["languages"] = {k: round(v / total * 100, 2) for k, v in langs.items()}
+self.metrics["languages_count"] = len(langs)
+else:
+self.metrics["languages"] = {}
+self.metrics["languages_count"] = 0
+
+# Documentation
+self.metrics["documentation"] = self._check_documentation()
+
+# Traffic estimation
+self.metrics["traffic"] = self._estimate_traffic()
+
+# Health
+self.metrics["health"] = self._compute_health()
+
+def _compute_commit_frequency(self, commits):
+"""Frequence de commits par mois sur les 12 derniers mois"""
+months = defaultdict(int)
+now = datetime.now(timezone.utc)
+
+for c in commits:
+try:
+date_str = c.get("commit", {}).get("author", {}).get("date", "")
+dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+key = dt.strftime("%Y-%m")
+months[key] += 1
+except Exception:
+continue
+
+# Remplir les 12 derniers mois
+result = {}
+for i in range(11, -1, -1):
+d = now - timedelta(days=30 * i)
+key = d.strftime("%Y-%m")
+result[key] = months.get(key, 0)
+
+return result
+
+def _compute_heatmap(self, commits):
+"""Heatmap par jour de la semaine x heure"""
+heatmap = defaultdict(int)
+
+for c in commits:
+try:
+date_str = c.get("commit", {}).get("author", {}).get("date", "")
+dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+key = str(dt.weekday()) + "_" + str(dt.hour)
+heatmap[key] += 1
+except Exception:
+continue
+
+return dict(heatmap)
+
+def _compute_authors(self, commits):
+"""Repartition des commits par auteur"""
+authors = Counter()
+for c in commits:
+try:
+author = c.get("commit", {}).get("author", {}).get("name", "Inconnu")
+authors[author] += 1
+except Exception:
+continue
+return dict(authors.most_common(10))
+
+def _check_documentation(self):
+"""Verifie la presence des fichiers de doc"""
+tree = self.data.get("tree", {})
+files = []
+if isinstance(tree, dict) and "tree" in tree:
+files = [f.get("path", "") for f in tree.get("tree", []) if f.get("type") == "blob"]
+
+files_lower = [f.lower() for f in files]
+
+checks = {
+"readme": any("readme" in f for f in files_lower),
+"license": any(f.startswith("license") for f in files_lower),
+"contributing": any("contributing" in f for f in files_lower),
+"code_of_conduct": any("code_of_conduct" in f or "code-of-conduct" in f for f in files_lower),
+"changelog": any("changelog" in f for f in files_lower),
+"security": any("security" in f for f in files_lower),
+"docs_folder": any(f.startswith("docs/") for f in files_lower),
+"examples": any("example" in f for f in files_lower),
+"tests": any("test" in f and (f.endswith(".py") or f.endswith(".js") or f.endswith(".go")) for f in files_lower),
+"ci": any(f.startswith(".github/workflows/") for f in files_lower),
+"dockerfile": any("dockerfile" in f for f in files_lower),
+"makefile": any("makefile" in f for f in files_lower),
+}
+
+checks["score"] = round(sum(1 for v in checks.values() if v) / len(checks) * 100, 1)
+checks["total_files"] = len(files)
+return checks
+
+def _estimate_traffic(self):
+"""
+Estimation du trafic (basé sur des formules observees)
+Note: GitHub ne fournit le trafic reel que via l'API authentifiee
+pour les repos dont on est proprietaire. Ici on estime.
+"""
+stars = self.metrics.get("stars", 0)
+forks = self.metrics.get("forks", 0)
+watchers = self.metrics.get("watchers", 0)
+issues = self.metrics.get("issues_total", 0)
+age_days = max(1, self.metrics.get("age_days", 1))
+
+# Formule d'estimation basee sur ratios observes
+# 1 star ~ 100 vues uniques initiales + 10 vues/mois continu
+monthly_views_est = int(
+(stars * 10) +
+(forks * 30) +
+(watchers * 5) +
+(issues * 2) +
+(age_days / 30 * 5)
+)
+
+weekly_views_est = int(monthly_views_est / 4.3)
+daily_views_est = int(monthly_views_est / 30)
+
+# Clones estimes (10% des vues)
+monthly_clones_est = int(monthly_views_est * 0.15)
+
+return {
+"monthly_views_est": monthly_views_est,
+"weekly_views_est": weekly_views_est,
+"daily_views_est": daily_views_est,
+"monthly_clones_est": monthly_clones_est,
+"note": "Estimation basee sur ratios observes (stars, forks, watchers, age)",
+}
+
+def _compute_health(self):
+"""Score de sante globale du repo"""
+metrics = self.metrics
+
+# Fraicheur
+if metrics["days_since_push"] <= 7:
+freshness = 100
+elif metrics["days_since_push"] <= 30:
+freshness = 80
+elif metrics["days_since_push"] <= 90:
+freshness = 60
+elif metrics["days_since_push"] <= 365:
+freshness = 35
+else:
+freshness = 10
+
+# Resolution
+resolution = metrics["issue_resolution_rate"]
+
+# Documentation
+doc_score = metrics["documentation"]["score"]
+
+# Communaute
+if metrics["contributors"] == 0:
+community = 20
+elif metrics["contributors"] == 1:
+community = 40
+elif metrics["contributors"] < 5:
+community = 60
+elif metrics["contributors"] < 20:
+community = 80
+else:
+community = 100
+
+# Activite
+commit_count = metrics["recent_commits"]
+if commit_count >= 100:
+activity = 100
+elif commit_count >= 50:
+activity = 80
+elif commit_count >= 20:
+activity = 60
+elif commit_count >= 5:
+activity = 40
+else:
+activity = 20
+
+health = (freshness * 0.3 + resolution * 0.2 + doc_score * 0.25 +
+community * 0.15 + activity * 0.1)
+
+return {
+"score": round(health, 1),
+"freshness": freshness,
+"resolution": round(resolution, 1),
+"documentation": doc_score,
+"community": community,
+"activity": activity,
+}
+
+# ──────────────────────────────────────────────────────────────────────────
+# SCORES
+# ──────────────────────────────────────────────────────────────────────────
+def compute_scores(self):
+m = self.metrics
+
+# Popularite
+star_score = min(100, math.log10(max(1, m["stars"]) + 1) * 25)
+fork_score = min(100, math.log10(max(1, m["forks"]) + 1) * 25)
+watch_score = min(100, math.log10(max(1, m["watchers"]) + 1) * 25)
+self.scores["popularity"] = round(star_score * 0.6 + fork_score * 0.25 + watch_score * 0.15, 2)
+
+# Activite
+if m["days_since_push"] <= 1:
+fresh = 100
+elif m["days_since_push"] <= 7:
+fresh = 90
+elif m["days_since_push"] <= 30:
+fresh = 75
+elif m["days_since_push"] <= 90:
+fresh = 50
+elif m["days_since_push"] <= 365:
+fresh = 25
+else:
+fresh = 5
+commit_score = min(100, math.log10(max(1, m["recent_commits"]) + 1) * 35)
+self.scores["activity"] = round(fresh * 0.6 + commit_score * 0.4, 2)
+
+# Documentation
+self.scores["documentation"] = m["documentation"]["score"]
+
+# Qualite
+issue_score = m["issue_resolution_rate"] if m["issues_total"] >= 5 else 50
+pr_score = min(100, math.log10(max(1, m["pulls_open_count"] + m["pulls_closed_count"]) + 1) * 35)
+branch_score = min(100, math.log10(max(1, m["branches"]) + 1) * 30)
+self.scores["quality"] = round(issue_score * 0.5 + pr_score * 0.3 + branch_score * 0.2, 2)
+
+# Communaute
+contrib_score = min(100, math.log10(max(1, m["contributors"]) + 1) * 40)
+fork_network = min(100, math.log10(max(1, m["forks"]) + 1) * 30)
+self.scores["community"] = round(contrib_score * 0.6 + fork_network * 0.4, 2)
+
+# Maintenance
+r = self.data["repo"]
+maintenance = 100
+if r.get("archived"): maintenance -= 40
+if r.get("disabled"): maintenance -= 50
+if r.get("fork"): maintenance -= 20
+if m["releases"] > 0: maintenance = min(100, maintenance + 10)
+if m["tags"] > 3: maintenance = min(100, maintenance + 5)
+self.scores["maintenance"] = max(0, maintenance)
+
+# Langages
+lang_score = min(100, m["languages_count"] * 15)
+if m["languages"]:
+top_pct = max(m["languages"].values())
+diversity = min(100, (1 - top_pct / 100) * 150)
+else:
+diversity = 0
+self.scores["languages"] = round(lang_score * 0.5 + diversity * 0.5, 2)
+
+# Taille
+size = m["size_kb"]
+if size < 10: size_score = 20
+elif size < 100: size_score = 40
+elif size < 1000: size_score = 65
+elif size < 10000: size_score = 85
+elif size < 100000: size_score = 100
+else: size_score = 90
+self.scores["size"] = size_score
+
+# Tendance (estimation)
+self.scores["momentum"] = self._compute_momentum()
+
+def _compute_momentum(self):
+"""Estime la croissance du repo"""
+commits = self.data.get("commits", [])
+if not isinstance(commits, list) or not commits:
+return 30
+
+# Comparer activite recente vs ancienne
+now = datetime.now(timezone.utc)
+recent = 0
+older = 0
+
+for c in commits:
+try:
+date_str = c.get("commit", {}).get("author", {}).get("date", "")
+dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+days_ago = (now - dt).days
+if days_ago <= 90:
+recent += 1
+elif days_ago <= 365:
+older += 1
+except Exception:
+continue
+
+if older == 0:
+if recent > 10: return 90
+if recent > 0: return 70
+return 40
+
+ratio = recent / older
+if ratio > 2: return 100
+if ratio > 1: return 85
+if ratio > 0.5: return 65
+if ratio > 0.2: return 45
+return 25
+
+def compute_global_score(self):
+weights = {
+"popularity": 0.20,
+"activity": 0.20,
+"documentation": 0.15,
+"quality": 0.15,
+"community": 0.15,
+"maintenance": 0.05,
+"languages": 0.05,
+"size": 0.05,
+}
+
+global_score = sum(self.scores.get(k, 0) * w for k, w in weights.items())
+
+# Bonus momentum
+global_score = global_score * 0.95 + self.scores.get("momentum", 50) * 0.05
+
+self.scores["global"] = round(global_score, 2)
+self.scores["_weights"] = weights
+
+# Grade
+if global_score >= 90:
+self.scores["grade"] = "S"
+self.scores["verdict"] = "EXCEPTIONNEL"
+self.scores["color"] = "#00ff9d"
+elif global_score >= 80:
+self.scores["grade"] = "A"
+self.scores["verdict"] = "EXCELLENT"
+self.scores["color"] = "#4ade80"
+elif global_score >= 70:
+self.scores["grade"] = "B"
+self.scores["verdict"] = "TRES BON"
+self.scores["color"] = "#a3e635"
+elif global_score >= 60:
+self.scores["grade"] = "C"
+self.scores["verdict"] = "BON"
+self.scores["color"] = "#fbbf24"
+elif global_score >= 50:
+self.scores["grade"] = "D"
+self.scores["verdict"] = "MOYEN"
+self.scores["color"] = "#fb923c"
+elif global_score >= 35:
+self.scores["grade"] = "E"
+self.scores["verdict"] = "FAIBLE"
+self.scores["color"] = "#f87171"
+else:
+self.scores["grade"] = "F"
+self.scores["verdict"] = "DEBUTANT"
+self.scores["color"] = "#ef4444"
+
+# ──────────────────────────────────────────────────────────────────────────
+# GRAPHS DATA
+# ──────────────────────────────────────────────────────────────────────────
+def build_graphs(self):
+m = self.metrics
+
+# 1. Commit frequency (line chart)
+self.graphs["commits_freq"] = {
+"type": "line",
+"labels": list(m["commit_frequency"].keys()),
+"values": list(m["commit_frequency"].values()),
+"title": "Commits par mois (12 derniers)",
+}
+
+# 2. Languages (pie chart)
+self.graphs["languages"] = {
+"type": "pie",
+"labels": list(m["languages"].keys()),
+"values": list(m["languages"].values()),
+"title": "Repartition des langages",
+}
+
+# 3. Authors (bar chart)
+authors = m.get("commit_authors", {})
+self.graphs["authors"] = {
+"type": "bar",
+"labels": list(authors.keys()),
+"values": list(authors.values()),
+"title": "Top contributeurs (commits)",
+}
+
+# 4. Scores (radar)
+score_labels = ["Popularite", "Activite", "Documentation", "Qualite",
+"Communaute", "Maintenance"]
+score_keys = ["popularity", "activity", "documentation", "quality",
+"community", "maintenance"]
+self.graphs["scores_radar"] = {
+"type": "radar",
+"labels": score_labels,
+"values": [self.scores.get(k, 0) for k in score_keys],
+"title": "Vue multi-dimensionnelle",
+}
+
+# 5. Issues (donut)
+self.graphs["issues"] = {
+"type": "donut",
+"labels": ["Ouvertes", "Fermees"],
+"values": [m["issues_open_count"], m["issues_closed_count"]],
+"title": "Issues",
+}
+
+# 6. Pull Requests (donut)
+self.graphs["pulls"] = {
+"type": "donut",
+"labels": ["Ouvertes", "Fermees"],
+"values": [m["pulls_open_count"], m["pulls_closed_count"]],
+"title": "Pull Requests",
+}
+
+# 7. Heatmap (grille)
+heatmap_data = []
+for d in range(7):
+for h in range(24):
+key = str(d) + "_" + str(h)
+heatmap_data.append({
+"day": d,
+"hour": h,
+"value": m["commit_heatmap"].get(key, 0),
+})
+self.graphs["heatmap"] = {
+"type": "heatmap",
+"data": heatmap_data,
+"title": "Heatmap commits (jour x heure)",
+}
+
+# 8. Traffic (bar)
+t = m["traffic"]
+self.graphs["traffic"] = {
+"type": "bar",
+"labels": ["Jour", "Semaine", "Mois"],
+"values": [t["daily_views_est"], t["weekly_views_est"], t["monthly_views_est"]],
+"title": "Vues estimees",
+}
+
+# ──────────────────────────────────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────────────────────────────────
+def analyze(self):
+if not self.fetch():
+return {"error": "Repo introuvable ou inaccessible"}
+
+self.compute_metrics()
+self.compute_scores()
+self.compute_global_score()
+self.build_graphs()
+
+r = self.data["repo"]
+
+return {
+"ok": True,
+"version": VERSION,
+"timestamp": datetime.now(timezone.utc).isoformat(),
+"repo": {
+"full_name": r.get("full_name"),
+"description": r.get("description"),
+"url": r.get("html_url"),
+"homepage": r.get("homepage"),
+"owner": {
+"login": (r.get("owner") or {}).get("login"),
+"avatar": (r.get("owner") or {}).get("avatar_url"),
+"url": (r.get("owner") or {}).get("html_url"),
+},
+"license": self.metrics["license"],
+"language": self.metrics["language"],
+"topics": self.metrics["topics"],
+"created_at": self.metrics.get("created_at"),
+"last_push": self.metrics.get("last_push"),
+"default_branch": self.metrics["default_branch"],
+},
+"metrics": self.metrics,
+"scores": self.scores,
+"graphs": self.graphs,
+"links": {
+"repo": r.get("html_url"),
+"issues": r.get("html_url") + "/issues",
+"pulls": r.get("html_url") + "/pulls",
+"releases": r.get("html_url") + "/releases",
+"commits": r.get("html_url") + "/commits",
+"contributors": r.get("html_url") + "/graphs/contributors",
+"network": r.get("html_url") + "/network",
+"wiki": r.get("html_url") + "/wiki",
+"actions": r.get("html_url") + "/actions",
+"settings": r.get("html_url") + "/settings",
+"insights": r.get("html_url") + "/pulse",
+"graphs": r.get("html_url") + "/graphs/traffic",
+},
+"api": {
+"requests_made": self.client.request_count,
+"rate_remaining": self.client.rate_remaining,
+"rate_limit": self.client.rate_limit,
+},
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML PAGE
+# ══════════════════════════════════════════════════════════════════════════════
+PAGE = """<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GitHub Analytics Engine</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,system-ui,sans-serif;background:#0a0014;color:#fff;padding:20px;min-height:100vh;background-image:radial-gradient(ellipse at top,rgba(200,164,92,0.08),transparent 60%)}
+.c{max-width:1200px;margin:0 auto}
+h1{color:#c8a45c;font-size:28px;margin-bottom:6px;background:linear-gradient(135deg,#fff,#c8a45c);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.s{color:#888;font-size:12px;margin-bottom:24px}
+.b{background:#14001f;border:1px solid #2a1a3a;border-radius:12px;padding:22px;margin-bottom:18px}
+.b h2{color:#c8a45c;font-size:13px;margin-bottom:14px;text-transform:uppercase;letter-spacing:2px}
+input{width:100%;background:#0a0014;border:1px solid #2a1a3a;color:#4ade80;padding:14px;border-radius:10px;font-family:monospace;font-size:13px;margin-bottom:12px}
+input:focus{outline:none;border-color:#c8a45c}
+button{background:linear-gradient(135deg,#c8a45c,#a88838);color:#000;border:none;padding:12px 24px;border-radius:999px;font-weight:700;cursor:pointer;font-size:13px;margin-right:8px;letter-spacing:1px}
+button:hover{opacity:0.9}
+button:disabled{opacity:0.4;cursor:not-allowed}
+button.sec{background:transparent;color:#c8a45c;border:1px solid #c8a45c}
+.score-hero{text-align:center;padding:40px 20px;background:linear-gradient(135deg,#14001f,#0a0014);border-radius:16px;border:2px solid #c8a45c;margin-bottom:18px;position:relative;overflow:hidden}
+.score-hero::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,transparent,#c8a45c,transparent)}
+.score-num{font-size:88px;font-weight:900;line-height:1;letter-spacing:-4px;background:linear-gradient(135deg,#fff,#c8a45c);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.score-grade{font-size:32px;margin-top:10px;letter-spacing:8px;font-weight:900}
+.score-verdict{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:3px;margin-top:10px}
+.score-momentum{font-size:11px;color:#4ade80;margin-top:14px;letter-spacing:1px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:18px}
+.dim{background:linear-gradient(135deg,#14001f,#0f0018);border:1px solid #2a1a3a;border-radius:12px;padding:16px;transition:all 0.3s}
+.dim:hover{border-color:#c8a45c;transform:translateY(-2px)}
+.dim .label{font-size:9px;color:#888;text-transform:uppercase;letter-spacing:2px;margin-bottom:8px}
+.dim .val{font-size:28px;font-weight:800;line-height:1;color:#c8a45c}
+.dim .weight{font-size:9px;color:#555;margin-left:6px;font-weight:400}
+.bar{height:6px;background:#0a0014;border-radius:3px;margin-top:10px;overflow:hidden}
+.bar-fill{height:100%;border-radius:3px;transition:width 1s ease}
+.meta{display:flex;gap:16px;align-items:center;padding:16px;background:#0a0014;border-radius:10px;margin-bottom:14px}
+.meta img{width:56px;height:56px;border-radius:50%;border:2px solid #c8a45c}
+.meta .info{flex:1;min-width:0}
+.meta .name{font-size:16px;font-weight:700;color:#fff;word-break:break-all}
+.meta .desc{font-size:12px;color:#888;margin-top:4px;line-height:1.4}
+.meta .stats{display:flex;gap:14px;margin-top:8px;font-size:11px;color:#c8a45c;font-family:monospace;flex-wrap:wrap}
+.tag{display:inline-block;background:rgba(200,164,92,0.15);border:1px solid rgba(200,164,92,0.3);color:#c8a45c;padding:4px 10px;border-radius:12px;font-size:10px;margin:3px 4px 3px 0;font-family:monospace}
+.link{display:inline-block;background:#1a0028;border:1px solid #2a1a3a;color:#4ade80;text-decoration:none;padding:8px 14px;border-radius:8px;font-size:11px;margin:4px 4px 4px 0;font-family:monospace;transition:all 0.2s}
+.link:hover{border-color:#c8a45c;color:#c8a45c;background:#200030}
+.graph-container{background:#0a0014;border-radius:10px;padding:16px;margin-bottom:14px}
+.graph-title{color:#c8a45c;font-size:11px;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px}
+canvas{max-width:100%;display:block}
+.heatmap{display:grid;grid-template-columns:40px repeat(24,1fr);gap:2px;font-size:9px;font-family:monospace}
+.heatmap-cell{padding:4px 2px;text-align:center;border-radius:2px;font-size:8px}
+.loader{text-align:center;padding:50px;color:#c8a45c}
+.sp{display:inline-block;width:40px;height:40px;border:3px solid rgba(200,164,92,0.2);border-top-color:#c8a45c;border-radius:50%;animation:spin 0.8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.error{color:#f87171;padding:20px;text-align:center;font-family:monospace}
+.stats-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:14px}
+.stat-box{background:#0a0014;border:1px solid #2a1a3a;border-radius:8px;padding:12px;text-align:center}
+.stat-box .n{font-size:20px;font-weight:800;color:#c8a45c;display:block;font-family:monospace}
+.stat-box .l{font-size:9px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-top:4px;display:block}
+</style></head><body><div class="c">
+<h1>GitHub Analytics Engine</h1>
+<p class="s">Analyse complete - Scores - Trafic - Graphiques HD</p>
+
+<div class="b">
+<h2>Repo a analyser</h2>
+<input id="url" placeholder="https://github.com/owner/repo" value="https://github.com/Aissamohammedi88/nekyll-is-a-static-site-generator-with-built-in-">
+<button id="btn" onclick="analyser()">ANALYSER</button>
+<button class="sec" onclick="exemple('torvalds/linux')">Linux</button>
+<button class="sec" onclick="exemple('microsoft/vscode')">VS Code</button>
+<button class="sec" onclick="exemple('facebook/react')">React</button>
+</div>
+
+<div id="out"></div>
+</div>
+
+<script>
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+
+async function analyser(){
+var url = document.getElementById('url').value.trim();
+if(!url){ alert('URL requise'); return; }
+document.getElementById('btn').disabled = true;
+document.getElementById('out').innerHTML = '<div class="b"><div class="loader"><div class="sp"></div><p style="margin-top:14px">Analyse en cours...</p><p style="color:#888;font-size:11px;margin-top:8px">Recuperation des donnees GitHub...</p></div></div>';
+try{
+var r = await fetch('/api/analyze?url=' + encodeURIComponent(url));
+var d = await r.json();
+if(d.error){ document.getElementById('out').innerHTML = '<div class="b"><div class="error">' + esc(d.error) + '</div></div>'; }
+else{ render(d); }
+}catch(e){ document.getElementById('out').innerHTML = '<div class="b"><div class="error">' + esc(e.message) + '</div></div>'; }
+finally{ document.getElementById('btn').disabled = false; }
+}
+
+function exemple(repo){
+document.getElementById('url').value = 'https://github.com/' + repo;
+analyser();
+}
+
+function render(d){
+var h = '';
+
+// HERO SCORE
+var color = d.scores.color || '#c8a45c';
+h += '<div class="score-hero" style="border-color:' + color + '">';
+h += '<div class="score-num" style="background:linear-gradient(135deg,#fff,' + color + ');-webkit-background-clip:text;-webkit-text-fill-color:transparent">' + d.scores.global + '</div>';
+h += '<div class="score-grade" style="color:' + color + '">' + esc(d.scores.grade) + '</div>';
+h += '<div class="score-verdict">' + esc(d.scores.verdict) + '</div>';
+h += '<div class="score-momentum">Momentum : ' + d.scores.momentum + '%</div>';
+h += '</div>';
+
+// META
+h += '<div class="b"><div class="meta">';
+if(d.repo.owner.avatar) h += '<img src="' + esc(d.repo.owner.avatar) + '" alt="">';
+h += '<div class="info">';
+h += '<div class="name">' + esc(d.repo.full_name) + '</div>';
+if(d.repo.description) h += '<div class="desc">' + esc(d.repo.description) + '</div>';
+h += '<div class="stats">';
+h += '<span>' + d.metrics.stars + ' stars</span>';
+h += '<span>' + d.metrics.forks + ' forks</span>';
+h += '<span>' + d.metrics.contributors + ' contributors</span>';
+h += '<span>' + d.metrics.age_years + ' ans</span>';
+h += '</div>';
+h += '</div></div>';
+if(d.repo.topics && d.repo.topics.length){
+d.repo.topics.forEach(function(t){ h += '<span class="tag">' + esc(t) + '</span>'; });
+}
+h += '</div>';
+
+// STATS GRID
+h += '<div class="b"><h2>Metriques cles</h2><div class="stats-row">';
+var stats = [
+['Stars', d.metrics.stars],
+['Forks', d.metrics.forks],
+['Watchers', d.metrics.watchers],
+['Contributors', d.metrics.contributors],
+['Issues', d.metrics.issues_total],
+['PRs', d.metrics.pulls_open_count + d.metrics.pulls_closed_count],
+['Branches', d.metrics.branches],
+['Tags', d.metrics.tags],
+['Releases', d.metrics.releases],
+['Langages', d.metrics.languages_count],
+['Fichiers', d.metrics.documentation.total_files],
+['Taille', d.metrics.size_mb + ' MB'],
+];
+stats.forEach(function(s){
+h += '<div class="stat-box"><span class="n">' + s[1] + '</span><span class="l">' + s[0] + '</span></div>';
+});
+h += '</div></div>';
+
+// TRAFIC
+h += '<div class="b"><h2>Trafic estime</h2><div class="stats-row">';
+var t = d.metrics.traffic;
+h += '<div class="stat-box"><span class="n">' + t.daily_views_est + '</span><span class="l">Vues / jour</span></div>';
+h += '<div class="stat-box"><span class="n">' + t.weekly_views_est + '</span><span class="l">Vues / semaine</span></div>';
+h += '<div class="stat-box"><span class="n">' + t.monthly_views_est + '</span><span class="l">Vues / mois</span></div>';
+h += '<div class="stat-box"><span class="n">' + t.monthly_clones_est + '</span><span class="l">Clones / mois</span></div>';
+h += '</div>';
+h += '<p style="color:#666;font-size:10px;margin-top:10px;font-family:monospace">' + esc(t.note) + '</p>';
+h += '</div>';
+
+// SCORES DIMENSIONS
+h += '<div class="b"><h2>Scores par dimension</h2><div class="grid">';
+var names = {
+popularity:'Popularite', activity:'Activite', documentation:'Documentation',
+quality:'Qualite', community:'Communaute', maintenance:'Maintenance',
+languages:'Langages', size:'Taille', momentum:'Momentum'
+};
+Object.keys(d.scores).forEach(function(k){
+if(k.startsWith('_') || k === 'global' || k === 'grade' || k === 'verdict' || k === 'color' || k === 'momentum') return;
+var v = d.scores[k];
+var weight = d.scores._weights && d.scores._weights[k] ? (d.scores._weights[k] * 100).toFixed(0) + '%' : '';
+var grad = 'linear-gradient(90deg,#c8a45c,#4ade80)';
+h += '<div class="dim">';
+h += '<div class="label">' + esc(names[k] || k) + ' <span class="weight">' + weight + '</span></div>';
+h += '<div class="val">' + v + '</div>';
+h += '<div class="bar"><div class="bar-fill" style="width:' + v + '%;background:' + grad + '"></div></div>';
+h += '</div>';
+});
+h += '</div></div>';
+
+// GRAPHS
+h += '<div class="b"><h2>Graphiques</h2>';
+
+// 1. Commits frequency (line)
+h += '<div class="graph-container"><div class="graph-title">' + esc(d.graphs.commits_freq.title) + '</div>';
+h += '<canvas id="g-commits" width="800" height="200"></canvas></div>';
+
+// 2. Languages (pie)
+h += '<div class="graph-container"><div class="graph-title">' + esc(d.graphs.languages.title) + '</div>';
+h += '<canvas id="g-langs" width="800" height="220"></canvas></div>';
+
+// 3. Radar scores
+h += '<div class="graph-container"><div class="graph-title">' + esc(d.graphs.scores_radar.title) + '</div>';
+h += '<canvas id="g-radar" width="400" height="400"></canvas></div>';
+
+// 4. Traffic (bars)
+h += '<div class="graph-container"><div class="graph-title">' + esc(d.graphs.traffic.title) + '</div>';
+h += '<canvas id="g-traffic" width="800" height="200"></canvas></div>';
+
+// 5. Issues (donut)
+h += '<div class="graph-container"><div class="graph-title">' + esc(d.graphs.issues.title) + '</div>';
+h += '<canvas id="g-issues" width="300" height="200"></canvas></div>';
+
+// 6. Heatmap
+h += '<div class="graph-container"><div class="graph-title">' + esc(d.graphs.heatmap.title) + '</div>';
+h += '<div id="heatmap-render"></div></div>';
+
+h += '</div>';
+
+// LINKS
+h += '<div class="b"><h2>Liens directs GitHub</h2>';
+Object.keys(d.links).forEach(function(k){
+if(d.links[k]) h += '<a class="link" href="' + esc(d.links[k]) + '" target="_blank">' + esc(k) + ' ></a>';
+});
+h += '</div>';
+
+// API INFO
+h += '<div class="b"><h2>API</h2>';
+h += '<p style="font-family:monospace;font-size:11px;color:#888">Requetes utilisees : ' + d.api.requests_made + '<br>';
+h += 'Rate limit : ' + d.api.rate_remaining + ' / ' + d.api.rate_limit + '</p>';
+h += '</div>';
+
+document.getElementById('out').innerHTML = h;
+
+// Render graphs
+setTimeout(function(){
+drawLine('g-commits', d.graphs.commits_freq);
+drawPie('g-langs', d.graphs.languages);
+drawRadar('g-radar', d.graphs.scores_radar);
+drawBars('g-traffic', d.graphs.traffic);
+drawDonut('g-issues', d.graphs.issues);
+drawHeatmap('heatmap-render', d.graphs.heatmap);
+}, 100);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CANVAS DRAWING FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+function drawLine(canvasId, data){
+var c = document.getElementById(canvasId);
+if(!c) return;
+var ctx = c.getContext('2d');
+var W = c.width, H = c.height;
+var pad = {l:50, r:20, t:20, b:40};
+var cw = W - pad.l - pad.r;
+var ch = H - pad.t - pad.b;
+var values = data.values;
+var labels = data.labels;
+var maxV = Math.max.apply(null, values.concat([1]));
+
+ctx.clearRect(0, 0, W, H);
+
+// Grid
+ctx.strokeStyle = '#1a0a28';
+ctx.lineWidth = 1;
+for(var i = 0; i <= 4; i++){
+var y = pad.t + ch * i / 4;
+ctx.beginPath();
+ctx.moveTo(pad.l, y);
+ctx.lineTo(pad.l + cw, y);
+ctx.stroke();
+}
+
+// Y labels
+ctx.fillStyle = '#666';
+ctx.font = '10px monospace';
+ctx.textAlign = 'right';
+for(var i = 0; i <= 4; i++){
+var y = pad.t + ch * i / 4;
+var v = Math.round(maxV * (4 - i) / 4);
+ctx.fillText(v, pad.l - 6, y + 3);
+}
+
+// Points
+if(values.length < 2) return;
+var stepX = cw / (values.length - 1);
+
+// Area gradient
+var grad = ctx.createLinearGradient(0, pad.t, 0, pad.t + ch);
+grad.addColorStop(0, 'rgba(200,164,92,0.4)');
+grad.addColorStop(1, 'rgba(200,164,92,0.0)');
+
+ctx.beginPath();
+ctx.moveTo(pad.l, pad.t + ch);
+for(var i = 0; i < values.length; i++){
+var x = pad.l + i * stepX;
+var y = pad.t + ch - (values[i] / maxV) * ch;
+ctx.lineTo(x, y);
+}
+ctx.lineTo(pad.l + cw, pad.t + ch);
+ctx.closePath();
+ctx.fillStyle = grad;
+ctx.fill();
+
+// Line
+ctx.beginPath();
+ctx.strokeStyle = '#c8a45c';
+ctx.lineWidth = 2;
+for(var i = 0; i < values.length; i++){
+var x = pad.l + i * stepX;
+var y = pad.t + ch - (values[i] / maxV) * ch;
+if(i === 0) ctx.moveTo(x, y);
+else ctx.lineTo(x, y);
+}
+ctx.stroke();
+
+// Points
+ctx.fillStyle = '#c8a45c';
+for(var i = 0; i < values.length; i++){
+var x = pad.l + i * stepX;
+var y = pad.t + ch - (values[i] / maxV) * ch;
+ctx.beginPath();
+ctx.arc(x, y, 3, 0, Math.PI * 2);
+ctx.fill();
+}
+
+// X labels
+ctx.fillStyle = '#666';
+ctx.font = '9px monospace';
+ctx.textAlign = 'center';
+for(var i = 0; i < labels.length; i += 2){
+var x = pad.l + i * stepX;
+ctx.fillText(labels[i], x, H - 10);
+}
+}
+
+function drawPie(canvasId, data){
+var c = document.getElementById(canvasId);
+if(!c) return;
+var ctx = c.getContext('2d');
+var W = c.width, H = c.height;
+
+ctx.clearRect(0, 0, W, H);
+
+var cx = W / 2;
+var cy = H / 2;
+var r = Math.min(W, H) * 0.35;
+
+var total = data.values.reduce(function(a, b){ return a + b; }, 0);
+if(total === 0) return;
+
+var colors = ['#c8a45c', '#4ade80', '#00d4ff', '#ff6ec7', '#fbbf24',
+'#a78bfa', '#f87171', '#60a5fa', '#fb923c', '#34d399'];
+
+var angle = -Math.PI / 2;
+
+data.values.forEach(function(v, i){
+var sliceAngle = (v / total) * Math.PI * 2;
+ctx.beginPath();
+ctx.moveTo(cx, cy);
+ctx.arc(cx, cy, r, angle, angle + sliceAngle);
+ctx.closePath();
+ctx.fillStyle = colors[i % colors.length];
+ctx.fill();
+ctx.strokeStyle = '#0a0014';
+ctx.lineWidth = 2;
+ctx.stroke();
+
+// Label
+if(v / total > 0.05){
+var midAngle = angle + sliceAngle / 2;
+var lx = cx + Math.cos(midAngle) * r * 0.7;
+var ly = cy + Math.sin(midAngle) * r * 0.7;
+ctx.fillStyle = '#000';
+ctx.font = 'bold 11px monospace';
+ctx.textAlign = 'center';
+ctx.textBaseline = 'middle';
+ctx.fillText(Math.round(v) + '%', lx, ly);
+}
+
+angle += sliceAngle;
+});
+
+// Legend
+ctx.font = '10px monospace';
+ctx.textAlign = 'left';
+ctx.textBaseline = 'middle';
+var legendX = 20;
+var legendY = 20;
+data.labels.forEach(function(l, i){
+ctx.fillStyle = colors[i % colors.length];
+ctx.fillRect(legendX, legendY + i * 18, 12, 12);
+ctx.fillStyle = '#ccc';
+ctx.fillText(l + ' (' + data.values[i] + '%)', legendX + 18, legendY + i * 18 + 6);
+});
+}
+
+function drawBars(canvasId, data){
+var c = document.getElementById(canvasId);
+if(!c) return;
+var ctx = c.getContext('2d');
+var W = c.width, H = c.height;
+var pad = {l:60, r:20, t:20, b:40};
+var cw = W - pad.l - pad.r;
+var ch = H - pad.t - pad.b;
+
+ctx.clearRect(0, 0, W, H);
+
+var maxV = Math.max.apply(null, data.values.concat([1]));
+var n = data.values.length;
+var barW = cw / n * 0.6;
+var gap = cw / n * 0.4;
+
+// Grid
+ctx.strokeStyle = '#1a0a28';
+for(var i = 0; i <= 4; i++){
+var y = pad.t + ch * i / 4;
+ctx.beginPath();
+ctx.moveTo(pad.l, y);
+ctx.lineTo(pad.l + cw, y);
+ctx.stroke();
+}
+
+data.values.forEach(function(v, i){
+var x = pad.l + (barW + gap) * i + gap / 2;
+var h = (v / maxV) * ch;
+var y = pad.t + ch - h;
+
+var grad = ctx.createLinearGradient(0, y, 0, y + h);
+grad.addColorStop(0, '#c8a45c');
+grad.addColorStop(1, '#4ade80');
+
+ctx.fillStyle = grad;
+ctx.fillRect(x, y, barW, h);
+
+// Value
+ctx.fillStyle = '#c8a45c';
+ctx.font = 'bold 11px monospace';
+ctx.textAlign = 'center';
+ctx.fillText(v, x + barW / 2, y - 6);
+
+// Label
+ctx.fillStyle = '#888';
+ctx.font = '10px monospace';
+ctx.fillText(data.labels[i], x + barW / 2, H - 15);
+});
+}
+
+function drawRadar(canvasId, data){
+var c = document.getElementById(canvasId);
+if(!c) return;
+var ctx = c.getContext('2d');
+var W = c.width, H = c.height;
+var cx = W / 2, cy = H / 2;
+var r = Math.min(W, H) * 0.35;
+
+ctx.clearRect(0, 0, W, H);
+
+var n = data.labels.length;
+var angleStep = (Math.PI * 2) / n;
+
+// Grid circles
+ctx.strokeStyle = '#2a1a3a';
+ctx.lineWidth = 1;
+for(var ring = 1; ring <= 4; ring++){
+ctx.beginPath();
+for(var i = 0; i < n; i++){
+var angle = -Math.PI / 2 + i * angleStep;
+var x = cx + Math.cos(angle) * r * ring / 4;
+var y = cy + Math.sin(angle) * r * ring / 4;
+if(i === 0) ctx.moveTo(x, y);
+else ctx.lineTo(x, y);
+}
+ctx.closePath();
+ctx.stroke();
+}
+
+// Axes
+ctx.strokeStyle = '#2a1a3a';
+for(var i = 0; i < n; i++){
+var angle = -Math.PI / 2 + i * angleStep;
+var x = cx + Math.cos(angle) * r;
+var y = cy + Math.sin(angle) * r;
+ctx.beginPath();
+ctx.moveTo(cx, cy);
+ctx.lineTo(x, y);
+ctx.stroke();
+}
+
+// Values
+ctx.beginPath();
+ctx.strokeStyle = '#c8a45c';
+ctx.fillStyle = 'rgba(200,164,92,0.3)';
+ctx.lineWidth = 2;
+for(var i = 0; i < n; i++){
+var angle = -Math.PI / 2 + i * angleStep;
+var v = data.values[i] / 100;
+var x = cx + Math.cos(angle) * r * v;
+var y = cy + Math.sin(angle) * r * v;
+if(i === 0) ctx.moveTo(x, y);
+else ctx.lineTo(x, y);
+}
+ctx.closePath();
+ctx.fill();
+ctx.stroke();
+
+// Points
+ctx.fillStyle = '#4ade80';
+for(var i = 0; i < n; i++){
+var angle = -Math.PI / 2 + i * angleStep;
+var v = data.values[i] / 100;
+var x = cx + Math.cos(angle) * r * v;
+var y = cy + Math.sin(angle) * r * v;
+ctx.beginPath();
+ctx.arc(x, y, 4, 0, Math.PI * 2);
+ctx.fill();
+}
+
+// Labels
+ctx.fillStyle = '#c8a45c';
+ctx.font = '10px monospace';
+ctx.textAlign = 'center';
+ctx.textBaseline = 'middle';
+for(var i = 0; i < n; i++){
+var angle = -Math.PI / 2 + i * angleStep;
+var x = cx + Math.cos(angle) * (r + 20);
+var y = cy + Math.sin(angle) * (r + 20);
+ctx.fillText(data.labels[i], x, y);
+}
+}
+
+function drawDonut(canvasId, data){
+var c = document.getElementById(canvasId);
+if(!c) return;
+var ctx = c.getContext('2d');
+var W = c.width, H = c.height;
+var cx = W / 2, cy = H / 2;
+var r = Math.min(W, H) * 0.35;
+var inner = r * 0.6;
+
+ctx.clearRect(0, 0, W, H);
+
+var total = data.values.reduce(function(a, b){ return a + b; }, 0);
+if(total === 0) return;
+
+var colors = ['#f87171', '#4ade80'];
+var angle = -Math.PI / 2;
+
+data.values.forEach(function(v, i){
+var sliceAngle = (v / total) * Math.PI * 2;
+ctx.beginPath();
+ctx.moveTo(cx, cy);
+ctx.arc(cx, cy, r, angle, angle + sliceAngle);
+ctx.closePath();
+ctx.fillStyle = colors[i % colors.length];
+ctx.fill();
+
+angle += sliceAngle;
+});
+
+// Inner circle
+ctx.beginPath();
+ctx.arc(cx, cy, inner, 0, Math.PI * 2);
+ctx.fillStyle = '#0a0014';
+ctx.fill();
+
+// Center text
+ctx.fillStyle = '#c8a45c';
+ctx.font = 'bold 18px monospace';
+ctx.textAlign = 'center';
+ctx.textBaseline = 'middle';
+ctx.fillText(total, cx, cy - 8);
+ctx.fillStyle = '#888';
+ctx.font = '10px monospace';
+ctx.fillText('TOTAL', cx, cy + 12);
+}
+
+function drawHeatmap(containerId, data){
+var container = document.getElementById(containerId);
+if(!container) return;
+
+var days = ['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'];
+var hours = [];
+for(var i = 0; i < 24; i++) hours.push(i);
+
+var values = {};
+data.data.forEach(function(d){
+values[d.day + '_' + d.hour] = d.value;
+});
+
+var maxV = Math.max.apply(null, data.data.map(function(d){ return d.value; }).concat([1]));
+
+var html = '<div class="heatmap">';
+html += '<div></div>';
+for(var h = 0; h < 24; h++){
+html += '<div style="color:#666;font-size:8px">' + (h % 3 === 0 ? h : '') + '</div>';
+}
+for(var d = 0; d < 7; d++){
+html += '<div style="color:#666;font-size:9px;display:flex;align-items:center">' + days[d] + '</div>';
+for(var h = 0; h < 24; h++){
+var v = values[d + '_' + h] || 0;
+var intensity = v / maxV;
+var color = 'rgba(200,164,92,' + (0.1 + intensity * 0.9) + ')';
+html += '<div class="heatmap-cell" style="background:' + color + '" title="' + days[d] + ' ' + h + 'h : ' + v + '"></div>';
+}
+}
+html += '</div>';
+
+container.innerHTML = html;
+}
+</script>
+</body></html>"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTTP HANDLER
+# ══════════════════════════════════════════════════════════════════════════════
+class Handler(http.server.BaseHTTPRequestHandler):
+
+def log_message(self, *a):
+pass
+
+def _send(self, code, body, ctype="text/html; charset=utf-8"):
+if isinstance(body, str):
+body = body.encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", ctype)
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Access-Control-Allow-Origin", "*")
+self.end_headers()
+try:
+self.wfile.write(body)
+except Exception:
+pass
+
+def do_GET(self):
+p = urllib.parse.urlparse(self.path)
+path = p.path
+qs = urllib.parse.parse_qs(p.query)
+
+if path in ("/", "/index.html"):
+self._send(200, PAGE)
+
+elif path == "/api/analyze":
+url = qs.get("url", [""])[0]
+if not url:
+self._send(400, json.dumps({"error": "URL requise"}), "application/json")
+return
+
+owner, repo = parse_url(url)
+if not owner or not repo:
+self._send(400, json.dumps({"error": "URL GitHub invalide"}), "application/json")
+return
+
+client = GitHubClient(TOKEN)
+engine = AnalyticsEngine(client, owner, repo)
+result = engine.analyze()
+
+self._send(200, json.dumps(result, ensure_ascii=False, default=str),
+"application/json; charset=utf-8")
+
+elif path == "/api/health":
+self._send(200, json.dumps({
+"status": "ok",
+"version": VERSION,
+"author": AUTHOR,
+"has_token": bool(TOKEN),
+}), "application/json")
+
+else:
+self._send(404, json.dumps({"error": "not found"}), "application/json")
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+def local_ip():
+try:
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("8.8.8.8", 80))
+ip = s.getsockname()[0]
+s.close()
+return ip
+except Exception:
+return "127.0.0.1"
+
+
+def cli_analyze(url):
+owner, repo = parse_url(url)
+if not owner or not repo:
+err("URL invalide")
+return
+
+client = GitHubClient(TOKEN)
+engine = AnalyticsEngine(client, owner, repo)
+result = engine.analyze()
+
+if result.get("error"):
+err(result["error"])
+return
+
+print()
+print(C + "=" * 70 + N)
+print(C + " " + result["repo"]["full_name"] + N)
+print(C + "=" * 70 + N)
+print()
+print(" " + G + "Score global : " + str(result["scores"]["global"]) + "/100" + N)
+print(" " + G + "Grade : " + result["scores"]["grade"] + " - " + result["scores"]["verdict"] + N)
+print()
+print(" Scores :")
+for k, v in result["scores"].items():
+if k.startswith("_") or k in ("global", "grade", "verdict", "color"):
+continue
+print(" " + k.ljust(15) + " : " + str(v).rjust(6))
+print()
+print(" Metriques :")
+print(" Stars : " + str(result["metrics"]["stars"]))
+print(" Forks : " + str(result["metrics"]["forks"]))
+print(" Contributors: " + str(result["metrics"]["contributors"]))
+print(" Issues : " + str(result["metrics"]["issues_total"]))
+print(" Age : " + str(result["metrics"]["age_years"]) + " ans")
+print()
+print(" Trafic estime :")
+t = result["metrics"]["traffic"]
+print(" Jour : " + str(t["daily_views_est"]))
+print(" Semaine: " + str(t["weekly_views_est"]))
+print(" Mois : " + str(t["monthly_views_est"]))
+print()
+
+
+def main():
+if len(sys.argv) > 1 and not sys.argv[1].startswith("--"):
+cli_analyze(sys.argv[1])
+return
+
+print()
+print(C + "=" * 70 + N)
+print(C + " GITHUB ANALYTICS ENGINE v" + VERSION + N)
+print(C + "=" * 70 + N)
+print(" Auteur : " + AUTHOR)
+print()
+print(" Port : " + str(PORT))
+print(" Token : " + ("present" if TOKEN else "absent (60 req/h max)"))
+print()
+print(" Local : http://127.0.0.1:" + str(PORT) + "/")
+print(" Reseau : http://" + local_ip() + ":" + str(PORT) + "/")
+print()
+print(" CLI : python3 github_analytics_engine.py <url>")
+print()
+
+try:
+with Server((HOST, PORT), Handler) as httpd:
+httpd.serve_forever()
+except KeyboardInterrupt:
+print("\nArrete.\n")
+except OSError as e:
+err("Port " + str(PORT) + " : " + str(e))
+
+
+if __name__ == "__main__":
+main()
